@@ -66,7 +66,7 @@ The common case: you want the origin of **target.com itself**, and the
 subdomains are only there to *surface candidate IPs*. Use `-t`:
 
 ```bash
-python3 ipreal_hunter.py -i subs.txt -t target.com
+python3 ipreal-hunter.py -i subs.txt -t target.com
 ```
 
 With `-t` set, `ipreal-hunter`:
@@ -96,16 +96,16 @@ are read from your existing subfinder config but the tool runs fully standalone.
 
 ```bash
 # basic — reads keys from ~/.config/subfinder/provider-config.yaml automatically
-python3 ipreal_hunter.py -i subs.txt
+python3 ipreal-hunter.py -i subs.txt
 
 # hunt + verify each candidate, custom output dir
-python3 ipreal_hunter.py -i subs.txt --verify -o results/
+python3 ipreal-hunter.py -i subs.txt --verify -o results/
 
 # free sources only (no API keys)
-python3 ipreal_hunter.py -i subs.txt --sources dns,crtsh,hackertarget
+python3 ipreal-hunter.py -i subs.txt --sources dns,crtsh,hackertarget
 
 # offline logic check
-python3 ipreal_hunter.py --self-test
+python3 ipreal-hunter.py --self-test
 ```
 
 ### Options
@@ -153,7 +153,7 @@ Override with `-o`.
 
 ```bash
 subfinder -d target.com -all -o subs.txt
-python3 ipreal_hunter.py -i subs.txt -t target.com
+python3 ipreal-hunter.py -i subs.txt -t target.com
 # DOMINANT origin (verdict ACCESS) -- verify it directly:
 curl -I http://$(head -1 out/target.com/accessible_origin.txt)/ -H "Host: target.com"
 # or validate the top candidates:

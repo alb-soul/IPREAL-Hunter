@@ -1007,10 +1007,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Origin / real-IP candidate hunter for authorized bug bounty & VDP recon.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
-  python3 ipreal_hunter.py -i subs.txt
-  python3 ipreal_hunter.py -i subs.txt --verify -o results/
-  python3 ipreal_hunter.py -i subs.txt --sources dns,crtsh,hackertarget
-  python3 ipreal_hunter.py --self-test
+  python3 ipreal-hunter.py -i subs.txt
+  python3 ipreal-hunter.py -i subs.txt --verify -o results/
+  python3 ipreal-hunter.py -i subs.txt --sources dns,crtsh,hackertarget
+  python3 ipreal-hunter.py --self-test
 
 REMINDER: only test targets you are explicitly authorized to test.""",
     )
