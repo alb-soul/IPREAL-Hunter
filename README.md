@@ -80,6 +80,35 @@ With `-t` set, `ipreal-hunter`:
 `-t` implies `--verify`. Without `-t`, `--verify` instead tests each IP against
 the host it was discovered from (useful when you care about many hosts at once).
 
+## Retesting a host against KNOWN origin IPs (`--origin-ips`)
+
+Discovery (step above) gives you `out_ip/origin_candidates.txt`. Later, when
+you focus on ONE host — e.g. your injection payloads keep getting blocked by
+the WAF — retest just that host against the already-known candidate IPs,
+without re-running discovery:
+
+```bash
+python3 ipreal-hunter.py -t app.target.com \
+  --origin-ips out_ip/origin_candidates.txt \
+  -o out_ip/app.target.com/
+```
+
+This skips all discovery sources and directly probes every IP in the file
+with `Host: app.target.com`, scoring each against the host's own baseline.
+Result: `out_ip/app.target.com/accessible_origin.txt` lists the IPs that
+actually serve the host. Retry your blocked payloads via direct IP:
+
+```bash
+# manual WAF-bypass attempt via confirmed origin IP:
+curl -i http://<ACCESS-IP>/injection-point -H "Host: app.target.com"
+# or replay the request in Burp with the Host header kept and the
+# connection pinned to <ACCESS-IP>
+```
+
+`--origin-ips` requires `-t`. The file accepts bare IPs, `IP:port` and
+`http(s)://IP/...` forms (one per line); private/invalid lines are skipped
+with a warning.
+
 ## Install
 
 Dependencies are **Python-only** — no external binaries/tools are required:

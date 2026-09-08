@@ -92,7 +92,7 @@ except ImportError:  # pragma: no cover
     _HAVE_MMH3 = False
 
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 UA = f"ipreal-hunter/{VERSION} (+bug-bounty recon)"
 CACHE_DIR = Path(os.path.expanduser("~/.cache/ipreal-hunter"))
 CACHE_TTL = 24 * 3600  # refresh CIDR feeds once a day
@@ -439,6 +439,32 @@ class Collector:
         f.sources.add(source)
 
 
+def load_known_ips(path: str) -> Tuple[List[str], int]:
+    """Read known candidate origin IPs from a file (one per line).
+
+    Accepts bare IPs and host:port forms (port stripped -- verification
+    always probes 443/443+80 directly). Returns (valid_ips, skipped_count).
+    """
+    valid: List[str] = []
+    seen = set()
+    skipped = 0
+    for raw in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # tolerate "IP", "IP:port", "http(s)://IP/..." forms
+        line = re.sub(r"^https?://", "", line).split("/")[0].split()[0]
+        if ":" in line and line.count(":") == 1:
+            line = line.split(":")[0]
+        line = line.strip("[]")
+        if _valid_public_ip(line) and line not in seen:
+            seen.add(line)
+            valid.append(line)
+        else:
+            skipped += 1
+    return valid, skipped
+
+
 def src_resolve(host: str, collector: Collector) -> None:
     records = []
     if _HAVE_DNSPYTHON:
@@ -708,6 +734,32 @@ def _cert_matches(ip: str, port: int, host: str) -> bool:
 # ----------------------------------------------------------------------------
 # Orchestration
 # ----------------------------------------------------------------------------
+def classify_findings(collector: Collector, db: ProviderDB, use_asn: bool,
+                      workers: int = 16) -> Tuple[
+                          List[Tuple[str, str, Finding]], List[Tuple[str, str, Finding]]]:
+    """Split collected IPs into (origins, shields).
+
+    Cymru ASN lookups can stall per-IP on filtered networks, so run them
+    concurrently instead of sequentially.
+    """
+    origins: List[Tuple[str, str, Finding]] = []
+    shields: List[Tuple[str, str, Finding]] = []
+
+    def _one(item):
+        ip, f = item
+        return classify_ip(ip, db, use_asn=use_asn)
+
+    items = list(collector.findings.items())
+    with cf.ThreadPoolExecutor(max_workers=min(max(workers, 1), 16)) as ex:
+        for (ip, f), (provider, is_cdn, method) in zip(
+                items, ex.map(_one, items)):
+            if is_cdn:
+                shields.append((provider, method, f))
+            else:
+                origins.append((provider, method, f))
+    return origins, shields
+
+
 def apex_of(host: str) -> str:
     parts = host.split(".")
     if len(parts) <= 2:
@@ -768,6 +820,65 @@ def gather(hosts: List[str], keys: Dict[str, Optional[str]], workers: int,
     return collector
 
 
+def run_known_origins(args, target: str, known_ips: List[str]) -> int:
+    """Verify a KNOWN candidate origin-IP list against one target host.
+
+    Skips discovery entirely: each IP is probed directly with
+    Host: <target> and scored against the target's own baseline.
+    This is the WAF-bypass workflow: find which known origin IP(s)
+    actually serve the host, then retry blocked payloads via direct IP.
+    """
+    if requests is not None:
+        try:
+            requests.packages.urllib3.disable_warnings()  # type: ignore
+        except Exception:  # noqa: BLE001
+            pass
+
+    folder = args.outdir or str(Path("out") / target)
+    args.outdir = folder
+
+    db = build_provider_db(offline=args.offline)
+    collector = Collector()
+    for ip in known_ips:
+        collector.add(ip, target, "known-list")
+    log(f"{len(collector.findings)} known origin IP(s) to verify against {target}", "info")
+
+    origins, shields = classify_findings(
+        collector, db, use_asn=not args.no_asn, workers=args.workers)
+
+    tbase = get_baseline(target)
+    if not tbase.get("status"):
+        log(f"could not fetch a baseline for {target} (site down / blocked?) -- "
+            f"scores will be weaker", "warn")
+
+    # Verify EVERY supplied IP (origins and shields alike): the user
+    # explicitly asked "is this host served from these IPs?".
+    to_probe = origins + shields
+    verified: Dict[str, Tuple[int, str, str]] = {}
+    log(f"probing {len(to_probe)} candidate IP(s) with Host: {target} ...", "info")
+    with cf.ThreadPoolExecutor(max_workers=min(args.workers, 12)) as ex:
+        def _dot(item):
+            _p, _m, f = item
+            return f.ip, verify_origin(f.ip, target, tbase,
+                                       timeout=args.verify_timeout,
+                                       probe_path=args.probe_path)
+        for ip, res in ex.map(_dot, to_probe):
+            verified[ip] = res
+    origins.sort(key=lambda t: verified.get(t[2].ip, (0, "", "UNKNOWN"))[0], reverse=True)
+
+    print_report(origins, shields, verified, args)
+    write_outputs(origins, shields, verified, args)
+    n_access = sum(1 for _, _, f in to_probe if verified.get(f.ip, (0, "", ""))[2] == "ACCESS")
+    if n_access:
+        log(f"{n_access} candidate IP(s) SERVE {target} directly -- "
+            f"retry blocked payloads via direct IP (Host: {target}). "
+            f"See {Path(folder) / 'accessible_origin.txt'}", "ok")
+    else:
+        log(f"no candidate IP serves {target} directly (all BLOCKED/DENIED/REDIRECT) -- "
+            f"origin not bypassable via this list", "warn")
+    return 0
+
+
 def run(args) -> int:
     if requests is not None:
         try:
@@ -807,14 +918,8 @@ def run(args) -> int:
     db = build_provider_db(offline=args.offline)
     collector = gather(hosts, keys, args.workers, enabled)
 
-    origins: List[Tuple[str, str, Finding]] = []
-    shields: List[Tuple[str, str, Finding]] = []
-    for ip, f in collector.findings.items():
-        provider, is_cdn, method = classify_ip(ip, db, use_asn=not args.no_asn)
-        if is_cdn:
-            shields.append((provider, method, f))
-        else:
-            origins.append((provider, method, f))
+    origins, shields = classify_findings(
+        collector, db, use_asn=not args.no_asn, workers=args.workers)
 
     origins.sort(key=lambda t: (t[0] != "Unknown", t[0]))
     shields.sort(key=lambda t: t[0])
@@ -994,6 +1099,21 @@ def self_test() -> int:
     assert apex_of("a.b.example.com") == "example.com", apex_of("a.b.example.com")
     assert apex_of("foo.example.co.id") == "example.co.id", apex_of("foo.example.co.id")
     assert _valid_public_ip("8.8.8.8") and not _valid_public_ip("10.0.0.1")
+    # --origin-ips loader: bare IP / host:port / URL forms, dedup, skip garbage
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
+        tf.write("1.2.3.4\n4.3.2.1:8443\nhttps://5.6.7.8/x\n# comment\n\n10.0.0.5\nnot-an-ip\n1.2.3.4\n")
+        tf_path = tf.name
+    try:
+        ips, skipped = load_known_ips(tf_path)
+        assert ips == ["1.2.3.4", "4.3.2.1", "5.6.7.8"], ips
+        assert skipped == 3, skipped  # private + garbage + duplicate
+        print(f"  [OK] load_known_ips -> {ips} (skipped={skipped})")
+    except AssertionError:
+        ok = False
+        print("  [FAIL] load_known_ips")
+    finally:
+        os.unlink(tf_path)
     print(C.wrap(C.G if ok else C.R, f"\nself-test {'PASSED' if ok else 'FAILED'}"))
     return 0 if ok else 1
 
@@ -1010,12 +1130,19 @@ def build_parser() -> argparse.ArgumentParser:
   python3 ipreal-hunter.py -i subs.txt
   python3 ipreal-hunter.py -i subs.txt --verify -o results/
   python3 ipreal-hunter.py -i subs.txt --sources dns,crtsh,hackertarget
+  python3 ipreal-hunter.py -t app.target.com --origin-ips out_ip/origin_candidates.txt -o out_ip/app/
   python3 ipreal-hunter.py --self-test
 
 REMINDER: only test targets you are explicitly authorized to test.""",
     )
     p.add_argument("-i", "--input", help="file with hosts/subdomains, one per line (e.g. subs.txt)")
     p.add_argument("-t", "--target", help="the specific host you want the origin of, e.g. target.com. Every candidate IP is probed with Host: <target> and scored against <target>'s own baseline. Implies --verify.")
+    p.add_argument("--origin-ips", metavar="FILE",
+                   help="file with KNOWN candidate origin IPs (one per line, from a previous "
+                        "discovery run e.g. out_ip/origin_candidates.txt). Skips discovery and "
+                        "directly verifies each IP against -t/--target. Requires -t. "
+                        "Use case: WAF blocks your payloads -> retest the host against known "
+                        "origins to find a direct-IP (WAF-bypass) path.")
     p.add_argument("-o", "--outdir", help="output directory (default: out/<target>, or out/<root-domain> when no -t). auto-created")
     p.add_argument("-c", "--config", help="subfinder provider-config.yaml (default: ~/.config/subfinder/provider-config.yaml)")
     p.add_argument("-w", "--workers", type=int, default=25, help="concurrent workers (default: 25)")
@@ -1035,6 +1162,31 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.self_test:
         return self_test()
+    if args.origin_ips:
+        target = (args.target or "").strip().lower().rstrip(".")
+        if not target:
+            log("--origin-ips requires -t/--target (which host should these IPs serve?).", "err")
+            return 2
+        try:
+            known_ips, skipped = load_known_ips(args.origin_ips)
+        except OSError as exc:
+            log(f"cannot read --origin-ips file: {exc}", "err")
+            return 2
+        if skipped:
+            log(f"skipped {skipped} invalid/private line(s) in --origin-ips file", "warn")
+        if not known_ips:
+            log("no valid public IPs in --origin-ips file", "err")
+            return 2
+        if requests is None:
+            log("missing dependency 'requests'. Run: pip install -r requirements.txt", "err")
+            return 2
+        banner = C.wrap(C.M + C.BOLD, f"ipreal-hunter v{VERSION}") + C.wrap(C.GR, "  authorized recon only")
+        print(banner, file=sys.stderr)
+        try:
+            return run_known_origins(args, target, known_ips)
+        except KeyboardInterrupt:
+            log("interrupted", "warn")
+            return 130
     if not args.input:
         log("missing -i/--input (a hosts file). Use --self-test for a logic check.", "err")
         return 2
