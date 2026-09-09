@@ -120,6 +120,12 @@ Dependencies are **Python-only** — no external binaries/tools are required:
 pip install -r requirements.txt   # requests, dnspython, PyYAML, mmh3
 ```
 
+Agar bisa dipanggil dari mana saja (`ipreal-hunter ...` tanpa path):
+
+```bash
+./install.sh   # symlink /usr/local/bin/ipreal-hunter + verifikasi --self-test
+```
+
 The optional `-i` input is a plain hosts file (one host per line, e.g. the
 output of `subfinder`), but `subfinder` itself is not a dependency. API keys
 are read from your existing subfinder config but the tool runs fully standalone.
