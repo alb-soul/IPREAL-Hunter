@@ -92,7 +92,7 @@ except ImportError:  # pragma: no cover
     _HAVE_MMH3 = False
 
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 UA = f"ipreal-hunter/{VERSION} (+bug-bounty recon)"
 CACHE_DIR = Path(os.path.expanduser("~/.cache/ipreal-hunter"))
 CACHE_TTL = 24 * 3600  # refresh CIDR feeds once a day
@@ -439,28 +439,34 @@ class Collector:
         f.sources.add(source)
 
 
+def parse_known_ip_line(raw: str) -> Optional[str]:
+    """Normalize one known-IP input line -> bare public IP, or None to skip."""
+    line = (raw or "").strip()
+    if not line or line.startswith("#"):
+        return None
+    # tolerate "IP", "IP:port", "http(s)://IP/..." forms
+    line = re.sub(r"^https?://", "", line).split("/")[0].split()[0]
+    if ":" in line and line.count(":") == 1:
+        line = line.split(":")[0]
+    line = line.strip("[]")
+    return line if _valid_public_ip(line) else None
+
+
 def load_known_ips(path: str) -> Tuple[List[str], int]:
     """Read known candidate origin IPs from a file (one per line).
 
     Accepts bare IPs and host:port forms (port stripped -- verification
-    always probes 443/443+80 directly). Returns (valid_ips, skipped_count).
+    always probes 443+80 directly). Returns (valid_ips, skipped_count).
     """
     valid: List[str] = []
     seen = set()
     skipped = 0
     for raw in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        # tolerate "IP", "IP:port", "http(s)://IP/..." forms
-        line = re.sub(r"^https?://", "", line).split("/")[0].split()[0]
-        if ":" in line and line.count(":") == 1:
-            line = line.split(":")[0]
-        line = line.strip("[]")
-        if _valid_public_ip(line) and line not in seen:
-            seen.add(line)
-            valid.append(line)
-        else:
+        ip = parse_known_ip_line(raw)
+        if ip and ip not in seen:
+            seen.add(ip)
+            valid.append(ip)
+        elif (raw or "").strip() and not (raw or "").strip().startswith("#"):
             skipped += 1
     return valid, skipped
 
@@ -1107,7 +1113,12 @@ def self_test() -> int:
     try:
         ips, skipped = load_known_ips(tf_path)
         assert ips == ["1.2.3.4", "4.3.2.1", "5.6.7.8"], ips
-        assert skipped == 3, skipped  # private + garbage + duplicate
+        assert skipped == 3, skipped  # private + garbage + duplikat
+        assert parse_known_ip_line("9.9.9.9") == "9.9.9.9"
+        assert parse_known_ip_line("  9.9.9.9:443 ") == "9.9.9.9"
+        assert parse_known_ip_line("10.1.2.3") is None
+        assert parse_known_ip_line("# komen") is None
+        assert parse_known_ip_line("") is None
         print(f"  [OK] load_known_ips -> {ips} (skipped={skipped})")
     except AssertionError:
         ok = False
@@ -1130,16 +1141,23 @@ def build_parser() -> argparse.ArgumentParser:
   python3 ipreal-hunter.py -i subs.txt
   python3 ipreal-hunter.py -i subs.txt --verify -o results/
   python3 ipreal-hunter.py -i subs.txt --sources dns,crtsh,hackertarget
-  python3 ipreal-hunter.py -t app.target.com --origin-ips out_ip/origin_candidates.txt -o out_ip/app/
+  python3 ipreal-hunter.py -t app.target.com -lio out_ip/origin_candidates.txt -o out_ip/app/
+  python3 ipreal-hunter.py -t app.target.com -io 1.2.3.4 -o out_ip/app-single/
   python3 ipreal-hunter.py --self-test
 
 REMINDER: only test targets you are explicitly authorized to test.""",
     )
     p.add_argument("-i", "--input", help="file with hosts/subdomains, one per line (e.g. subs.txt)")
     p.add_argument("-t", "--target", help="the specific host you want the origin of, e.g. target.com. Every candidate IP is probed with Host: <target> and scored against <target>'s own baseline. Implies --verify.")
-    p.add_argument("--origin-ips", metavar="FILE",
+    p.add_argument("-io", "--input-origin", metavar="IP",
+                   help="ONE known candidate origin IP to test (e.g. -io 1.2.3.4). "
+                        "Skips discovery and directly verifies it against -t/--target. "
+                        "Requires -t. Quick check: is this host served from this IP?")
+    p.add_argument("-lio", "--list-input-origin", "--origin-ips", metavar="FILE",
+                   dest="list_input_origin",
                    help="file with KNOWN candidate origin IPs (one per line, from a previous "
-                        "discovery run e.g. out_ip/origin_candidates.txt). Skips discovery and "
+                        "discovery run e.g. out_ip/origin_candidates.txt or "
+                        "out_ip/accessible_origin.txt). Skips discovery and "
                         "directly verifies each IP against -t/--target. Requires -t. "
                         "Use case: WAF blocks your payloads -> retest the host against known "
                         "origins to find a direct-IP (WAF-bypass) path.")
@@ -1162,20 +1180,39 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.self_test:
         return self_test()
-    if args.origin_ips:
+    list_file = getattr(args, "list_input_origin", None)
+    if args.input_origin or list_file:
         target = (args.target or "").strip().lower().rstrip(".")
         if not target:
-            log("--origin-ips requires -t/--target (which host should these IPs serve?).", "err")
+            log("-io/-lio requires -t/--target (which host should these IPs serve?).", "err")
             return 2
-        try:
-            known_ips, skipped = load_known_ips(args.origin_ips)
-        except OSError as exc:
-            log(f"cannot read --origin-ips file: {exc}", "err")
-            return 2
+        known_ips: List[str] = []
+        seen: Set[str] = set()
+        skipped = 0
+        if args.input_origin:
+            ip = parse_known_ip_line(args.input_origin)
+            if ip:
+                seen.add(ip)
+                known_ips.append(ip)
+            else:
+                log(f"invalid -io/--input-origin value: {args.input_origin!r} "
+                    f"(need a public IP)", "err")
+                return 2
+        if list_file:
+            try:
+                file_ips, file_skipped = load_known_ips(list_file)
+            except OSError as exc:
+                log(f"cannot read -lio file: {exc}", "err")
+                return 2
+            skipped += file_skipped
+            for ip in file_ips:
+                if ip not in seen:
+                    seen.add(ip)
+                    known_ips.append(ip)
         if skipped:
-            log(f"skipped {skipped} invalid/private line(s) in --origin-ips file", "warn")
+            log(f"skipped {skipped} invalid/private line(s) in known-IP input", "warn")
         if not known_ips:
-            log("no valid public IPs in --origin-ips file", "err")
+            log("no valid public IPs in known-IP input", "err")
             return 2
         if requests is None:
             log("missing dependency 'requests'. Run: pip install -r requirements.txt", "err")

@@ -89,8 +89,10 @@ without re-running discovery:
 
 ```bash
 python3 ipreal-hunter.py -t app.target.com \
-  --origin-ips out_ip/origin_candidates.txt \
+  -lio out_ip/origin_candidates.txt \
   -o out_ip/app.target.com/
+# atau satu IP saja:
+python3 ipreal-hunter.py -t app.target.com -io 1.2.3.4 -o out_ip/app-single/
 ```
 
 This skips all discovery sources and directly probes every IP in the file
@@ -105,9 +107,10 @@ curl -i http://<ACCESS-IP>/injection-point -H "Host: app.target.com"
 # connection pinned to <ACCESS-IP>
 ```
 
-`--origin-ips` requires `-t`. The file accepts bare IPs, `IP:port` and
-`http(s)://IP/...` forms (one per line); private/invalid lines are skipped
-with a warning.
+`-lio` (alias lama `--origin-ips` tetap berfungsi) requires `-t`. The file
+accepts bare IPs, `IP:port` and `http(s)://IP/...` forms (one per line);
+private/invalid lines are skipped with a warning. `-io` is the same check
+for a single IP given directly on the command line.
 
 ## Install
 
