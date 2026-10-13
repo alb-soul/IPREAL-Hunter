@@ -163,6 +163,8 @@ python3 ipreal-hunter.py --self-test
                 origin_candidates.txt (default 0 = keep all)
 --probe-path    path probed on direct-IP verification (default: /)
 --verify-timeout  per-IP verification timeout in seconds (default: 12)
+--no-cache        disable API response cache (always re-query)
+--cache-ttl       API cache TTL in seconds (default: 604800 = 7d)
 --no-asn        disable Team Cymru ASN fallback
 --offline       skip live CIDR feeds (ASN-only)
 --self-test     run offline logic check

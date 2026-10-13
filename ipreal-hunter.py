@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import hashlib
 import ipaddress
 import json
 import os
@@ -92,7 +93,7 @@ except ImportError:  # pragma: no cover
     _HAVE_MMH3 = False
 
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 UA = f"ipreal-hunter/{VERSION} (+bug-bounty recon)"
 CACHE_DIR = Path(os.path.expanduser("~/.cache/ipreal-hunter"))
 CACHE_TTL = 24 * 3600  # refresh CIDR feeds once a day
@@ -257,6 +258,76 @@ def cached_fetch(name: str, url: str, timeout: int = 25) -> Optional[str]:
         if cache_file.exists():
             return cache_file.read_text(encoding="utf-8", errors="replace")
     return None
+
+
+# ----------------------------------------------------------------------------
+# Per-host API response cache (TTL) — re-runs skip unchanged history
+# ----------------------------------------------------------------------------
+# History sources (VT/shodan/censys/...) change slowly; verification stays
+# live. Cache key covers method+url+headers+params+body. Privacy: the file
+# stores only status+body, the filename is a hash (API keys never persisted).
+API_CACHE_TTL_DEFAULT = 7 * 86400
+_API_CACHE_ON = True
+_API_CACHE_TTL = API_CACHE_TTL_DEFAULT
+_API_CACHE_DIR = None  # override in tests; default CACHE_DIR/"api"
+
+
+class CachedResp:
+    """Minimal requests.Response shim (status_code/text/json) for cached replies."""
+
+    def __init__(self, status_code: int, text: str):
+        self.status_code = status_code
+        self.text = text
+
+    def json(self):
+        return json.loads(self.text)
+
+
+def _api_cache_file(source: str, fingerprint: str) -> Path:
+    h = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
+    d = _API_CACHE_DIR if _API_CACHE_DIR is not None else (CACHE_DIR / "api")
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{source}-{h}.json"
+
+
+def api_fetch(source: str, url: str, *, method: str = "GET",
+              headers: Optional[dict] = None, params: Optional[dict] = None,
+              json_body: Optional[dict] = None,
+              timeout: int = 25) -> Optional[CachedResp]:
+    """GET/POST with file cache (200-only, TTL). None on transport error.
+
+    Non-200 passes through uncached so quota/auth changes surface promptly.
+    """
+    if requests is None:
+        return None
+    fp = "\n".join([
+        method.upper(), url,
+        json.dumps(headers or {}, sort_keys=True, default=str),
+        json.dumps(params or {}, sort_keys=True, default=str),
+        json.dumps(json_body or {}, sort_keys=True, default=str),
+    ])
+    cf_path = _api_cache_file(source, fp)
+    if _API_CACHE_ON:
+        try:
+            if cf_path.exists() and (time.time() - cf_path.stat().st_mtime) < _API_CACHE_TTL:
+                data = json.loads(cf_path.read_text(encoding="utf-8", errors="replace"))
+                if isinstance(data, dict) and data.get("status") == 200 and data.get("text"):
+                    return CachedResp(200, data["text"])
+        except (OSError, ValueError):
+            pass
+    try:
+        if method.upper() == "POST":
+            r = requests.post(url, headers=headers, json=json_body, timeout=timeout)
+        else:
+            r = http_get(url, timeout=timeout, headers=headers, params=params)
+        if r.status_code == 200 and r.text and _API_CACHE_ON:
+            try:
+                cf_path.write_text(json.dumps({"status": 200, "text": r.text}), encoding="utf-8")
+            except OSError:
+                pass
+        return CachedResp(r.status_code, r.text or "")
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------------------
@@ -492,8 +563,8 @@ def src_resolve(host: str, collector: Collector) -> None:
 
 def src_crtsh(domain: str, collector: Collector, extra_hosts: Set[str]) -> None:
     try:
-        r = http_get(f"https://crt.sh/?q=%25.{domain}&output=json", timeout=30)
-        if r.status_code != 200:
+        r = api_fetch("crtsh", f"https://crt.sh/?q=%25.{domain}&output=json", timeout=30)
+        if r is None or r.status_code != 200:
             return
         for entry in r.json():
             for name in str(entry.get("name_value", "")).splitlines():
@@ -508,7 +579,9 @@ def src_crtsh(domain: str, collector: Collector, extra_hosts: Set[str]) -> None:
 
 def src_hackertarget(host: str, collector: Collector) -> None:
     try:
-        r = http_get(f"https://api.hackertarget.com/hostsearch/?q={host}", timeout=20)
+        r = api_fetch("hackertarget", f"https://api.hackertarget.com/hostsearch/?q={host}", timeout=20)
+        if r is None:
+            return
         if r.status_code == 200 and "API count exceeded" not in r.text:
             for line in r.text.splitlines():
                 parts = line.split(",")
@@ -520,10 +593,13 @@ def src_hackertarget(host: str, collector: Collector) -> None:
 
 def src_securitytrails(host: str, key: str, collector: Collector) -> None:
     try:
-        r = http_get(
+        r = api_fetch(
+            "securitytrails",
             f"https://api.securitytrails.com/v1/history/{host}/dns/a",
             timeout=25, headers={"APIKEY": key},
         )
+        if r is None:
+            return
         if r.status_code == 200:
             data = r.json()
             for rec in data.get("records", []):
@@ -539,10 +615,13 @@ def src_securitytrails(host: str, key: str, collector: Collector) -> None:
 
 def src_virustotal(host: str, key: str, collector: Collector) -> None:
     try:
-        r = http_get(
+        r = api_fetch(
+            "virustotal",
             f"https://www.virustotal.com/api/v3/domains/{host}/resolutions",
             timeout=25, headers={"x-apikey": key}, params={"limit": 40},
         )
+        if r is None:
+            return
         if r.status_code == 200:
             for item in r.json().get("data", []):
                 ip = item.get("attributes", {}).get("ip_address")
@@ -554,8 +633,11 @@ def src_virustotal(host: str, key: str, collector: Collector) -> None:
 
 def src_shodan_domain(domain: str, key: str, collector: Collector) -> None:
     try:
-        r = http_get(f"https://api.shodan.io/dns/domain/{domain}",
-                     timeout=25, params={"key": key})
+        r = api_fetch("shodan",
+                      f"https://api.shodan.io/dns/domain/{domain}",
+                      timeout=25, params={"key": key})
+        if r is None:
+            return
         if r.status_code == 200:
             data = r.json()
             for rec in data.get("data", []):
@@ -569,13 +651,17 @@ def src_shodan_domain(domain: str, key: str, collector: Collector) -> None:
 
 def src_censys(domain: str, token: str, collector: Collector) -> None:
     try:
-        r = requests.post(
+        r = api_fetch(
+            "censys",
             "https://search.censys.io/api/v2/hosts/search",
+            method="POST",
             headers={"Authorization": f"Bearer {token}", "User-Agent": UA},
-            json={"q": f"services.tls.certificates.leaf_data.names: {domain}",
-                  "per_page": 50},
+            json_body={"q": f"services.tls.certificates.leaf_data.names: {domain}",
+                       "per_page": 50},
             timeout=25,
         )
+        if r is None:
+            return
         if r.status_code == 200:
             for hit in r.json().get("result", {}).get("hits", []):
                 ip = hit.get("ip")
@@ -589,13 +675,16 @@ def src_censys(domain: str, token: str, collector: Collector) -> None:
 
 def src_certspotter(domain: str, key: str, collector: Collector, extra_hosts: Set[str]) -> None:
     try:
-        r = http_get(
+        r = api_fetch(
+            "certspotter",
             "https://api.certspotter.com/v1/issuances",
             timeout=25,
             headers={"Authorization": f"Bearer {key}"} if key else None,
             params={"domain": domain, "include_subdomains": "true",
                     "expand": "dns_names"},
         )
+        if r is None:
+            return
         if r.status_code == 200:
             for iss in r.json():
                 for name in iss.get("dns_names", []):
@@ -608,8 +697,11 @@ def src_certspotter(domain: str, key: str, collector: Collector, extra_hosts: Se
 
 def src_dnsdumpster(domain: str, key: str, collector: Collector) -> None:
     try:
-        r = http_get(f"https://api.dnsdumpster.com/domain/{domain}",
-                     timeout=25, headers={"X-API-Key": key})
+        r = api_fetch("dnsdumpster",
+                      f"https://api.dnsdumpster.com/domain/{domain}",
+                      timeout=25, headers={"X-API-Key": key})
+        if r is None:
+            return
         if r.status_code == 200:
             data = r.json()
             for rec in data.get("a", []):
@@ -712,6 +804,9 @@ def verify_origin(ip: str, host: str, baseline: dict, timeout: int = 12,
                     score = max(score, 85); notes.append("tls-san-match")
             except Exception:  # noqa: BLE001
                 pass
+            if score >= 70:
+                break  # ACCESS confirmed via https; http probe adds nothing
+                # (score monotonic -> verdict can't downgrade; saves one probe)
     note = ",".join(sorted(set(notes)))
     if not note:
         note = "reachable" if reached else "no-response"
@@ -921,6 +1016,12 @@ def run(args) -> int:
         "shodan", "censys", "certspotter", "dnsdumpster",
     }
 
+    global _API_CACHE_ON, _API_CACHE_TTL
+    _API_CACHE_ON = not args.no_cache
+    _API_CACHE_TTL = args.cache_ttl
+    if not _API_CACHE_ON:
+        log("API response cache disabled (--no-cache)", "info")
+
     db = build_provider_db(offline=args.offline)
     collector = gather(hosts, keys, args.workers, enabled)
 
@@ -1125,6 +1226,90 @@ def self_test() -> int:
         print("  [FAIL] load_known_ips")
     finally:
         os.unlink(tf_path)
+    # api_fetch cache: roundtrip + TTL-expiry + non-200 tak dicache
+    global _API_CACHE_ON, _API_CACHE_TTL, _API_CACHE_DIR
+    import shutil as _shutil
+    _t2d = tempfile.mkdtemp(prefix="ipreal-cache-test-")
+    _old_cache = (_API_CACHE_ON, _API_CACHE_TTL, _API_CACHE_DIR)
+    _real_http_get = globals()["http_get"]
+    _calls = {"n": 0}
+
+    def _fake_http_get(url, timeout=20, headers=None, params=None):
+        _calls["n"] += 1
+
+        class _R:
+            status_code = 200
+            text = '{"ok": true}'
+
+        return _R()
+
+    _API_CACHE_ON, _API_CACHE_TTL, _API_CACHE_DIR = True, 3600, Path(_t2d)
+    globals()["http_get"] = _fake_http_get
+    try:
+        _r1 = api_fetch("selftest", "https://x.invalid/a", timeout=5)
+        _r2 = api_fetch("selftest", "https://x.invalid/a", timeout=5)
+        assert _calls["n"] == 1 and _r1.text == _r2.text == '{"ok": true}', (_calls["n"], _r1, _r2)
+        _API_CACHE_TTL = 0  # paksa expired -> fetch ulang
+        _r3 = api_fetch("selftest", "https://x.invalid/a", timeout=5)
+        assert _calls["n"] == 2, _calls
+        print("  [OK] api cache roundtrip + ttl-expiry")
+    except AssertionError as _e:
+        ok = False
+        print(f"  [FAIL] api cache: {_e}")
+    finally:
+        globals()["http_get"] = _real_http_get
+        _API_CACHE_ON, _API_CACHE_TTL, _API_CACHE_DIR = _old_cache
+        _shutil.rmtree(_t2d, ignore_errors=True)
+    # verify early-exit: https ACCESS -> http diskip (1 probe); https gagal -> http tetap jalan
+    if requests is not None:
+        _real_get = requests.get
+        _seen_urls = []
+
+        class _FakeResp:
+            def __init__(self, status=200, body=b"<html><title>Acme</title>ok</html>"):
+                self.status_code = status
+                self.content = body
+                self.text = body.decode("utf-8", "replace")
+                self.headers = {}
+                self.is_redirect = False
+                self.is_permanent_redirect = False
+
+        def _fake_get(url, **kw):
+            _seen_urls.append(url)
+            if ":443/" in url:
+                return _FakeResp(200)
+            if ":80/" in url and _fake_get.fail80:
+                raise ConnectionError("refused")
+            return _FakeResp(403, b"forbidden")
+
+        _fake_get.fail80 = False
+        _tbase = {"title": "Acme", "len": len(b"<html><title>Acme</title>ok</html>"),
+                  "status": 200, "server": None}
+        requests.get = _fake_get
+        try:
+            _seen_urls.clear()
+            _sc, _nt, _vd = verify_origin("127.0.0.1", "acme.invalid", _tbase, timeout=5)
+            assert _vd == "ACCESS" and len(_seen_urls) == 1 and ":443/" in _seen_urls[0], (_vd, _seen_urls)
+            print("  [OK] verify early-exit on ACCESS (http skipped)")
+            _fake_get.fail80 = True
+            _seen_urls.clear()
+
+            def _fake_get2(url, **kw):
+                _seen_urls.append(url)
+                if ":443/" in url:
+                    raise ConnectionError("down")
+                # body jauh beda (500B vs 33B) agar body-size-match tak ikut tembak
+                return _FakeResp(403, b"x" * 500)
+
+            requests.get = _fake_get2
+            _sc2, _nt2, _vd2 = verify_origin("127.0.0.1", "acme.invalid", _tbase, timeout=5)
+            assert _vd2 == "DENIED" and len(_seen_urls) == 2, (_vd2, _seen_urls)
+            print("  [OK] verify tetap probe http saat https gagal")
+        except AssertionError as _e:
+            ok = False
+            print(f"  [FAIL] verify early-exit: {_e}")
+        finally:
+            requests.get = _real_get
     print(C.wrap(C.G if ok else C.R, f"\nself-test {'PASSED' if ok else 'FAILED'}"))
     return 0 if ok else 1
 
@@ -1169,6 +1354,8 @@ REMINDER: only test targets you are explicitly authorized to test.""",
     p.add_argument("--min-score", type=int, default=0, help="only write candidates with confidence >= N to origin_candidates.txt (used with --verify/-t; default 0 = keep all)")
     p.add_argument("--probe-path", default="/", help="path probed during direct-IP verification (default: /)")
     p.add_argument("--verify-timeout", type=int, default=12, help="per-IP verification connect/read timeout in seconds (default: 12)")
+    p.add_argument("--no-cache", action="store_true", help="disable API response cache (always re-query history sources)")
+    p.add_argument("--cache-ttl", type=int, default=7 * 86400, help="API cache TTL in seconds (default: 604800 = 7d)")
     p.add_argument("--no-asn", action="store_true", help="disable Team Cymru ASN fallback classification")
     p.add_argument("--offline", action="store_true", help="skip live CIDR feeds (ASN-only classification)")
     p.add_argument("--self-test", action="store_true", help="run offline logic self-test and exit")
