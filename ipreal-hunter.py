@@ -871,13 +871,88 @@ def apex_of(host: str) -> str:
     return ".".join(parts[-2:])
 
 
+def _norm_scope(value: str) -> str:
+    s = (value or "").strip().lower().rstrip(".")
+    if s.startswith("*."):
+        s = s[2:]
+    return s.strip(".")
+
+
+def parse_scopes(values: Optional[List[str]]) -> List[str]:
+    """--scope values: repeatable and/or comma separated, normalized + deduped."""
+    scopes: List[str] = []
+    for raw in values or []:
+        for part in str(raw).split(","):
+            s = _norm_scope(part)
+            if s and s not in scopes:
+                scopes.append(s)
+    return scopes
+
+
+def host_in_scope(host: str, scopes: List[str]) -> bool:
+    if not scopes:
+        return True
+    h = (host or "").strip().lower().rstrip(".")
+    return any(h == s or h.endswith("." + s) for s in scopes)
+
+
+def discovery_domains(hosts: List[str],
+                      scopes: List[str]) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Domains for per-apex sources + hosts whose apex_of() is a broader domain."""
+    if scopes:
+        return list(scopes), []
+    domains = sorted({apex_of(h) for h in hosts})
+    collapsed = [(h, apex_of(h)) for h in hosts if apex_of(h) != h]
+    return domains, collapsed
+
+
+def _prune_out_of_scope(collector: Collector, scopes: List[str]) -> int:
+    """Drop findings whose every known host is outside --scope; trim host sets.
+
+    Findings with no host attribution are kept: with --scope the queries
+    themselves were scoped, so such an IP still came from an in-scope query.
+    """
+    if not scopes:
+        return 0
+    dropped = 0
+    kept: Dict[str, Finding] = {}
+    for ip, f in collector.findings.items():
+        if not f.hosts:
+            kept[ip] = f
+            continue
+        in_scope_hosts = {h for h in f.hosts if host_in_scope(h, scopes)}
+        if not in_scope_hosts:
+            dropped += 1
+            continue
+        f.hosts = in_scope_hosts
+        kept[ip] = f
+    collector.findings = kept
+    return dropped
+
+
 def gather(hosts: List[str], keys: Dict[str, Optional[str]], workers: int,
-           enabled: Set[str]) -> Collector:
+           enabled: Set[str], scopes: Optional[List[str]] = None) -> Collector:
+    scopes = scopes or []
     collector = Collector()
-    apexes = sorted({apex_of(h) for h in hosts})
+    if scopes:
+        kept_hosts = [h for h in hosts if host_in_scope(h, scopes)]
+        if len(kept_hosts) != len(hosts):
+            log(f"--scope: ignored {len(hosts) - len(kept_hosts)} input host(s) "
+                f"outside {', '.join(scopes)}", "warn")
+        hosts = kept_hosts
+        if not hosts:
+            log("no input host is inside --scope; nothing to gather", "warn")
+            return collector
+    apexes, collapsed = discovery_domains(hosts, scopes)
+    if collapsed:
+        h, apex = collapsed[0]
+        log(f"apex_of() collapsed {len(collapsed)}/{len(hosts)} host(s) to a shorter "
+            f"apex (e.g. {h} -> {apex}); per-apex sources will query that apex. "
+            f"Use --scope <suffix> to keep discovery inside the target subtree.", "warn")
     extra_hosts: Set[str] = set()
 
-    log(f"{len(hosts)} hosts across {len(apexes)} apex domain(s)", "info")
+    label = "scope suffix(es)" if scopes else "apex domain(s)"
+    log(f"{len(hosts)} hosts across {len(apexes)} {label}", "info")
 
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
         futs = []
@@ -912,11 +987,21 @@ def gather(hosts: List[str], keys: Dict[str, Optional[str]], workers: int,
     log(f"per-apex sources done -> {len(collector.findings)} IPs, "
         f"{len(extra_hosts)} extra hosts from CT", "src")
 
-    new_hosts = [h for h in extra_hosts if h not in set(hosts)]
+    new_hosts = [h for h in extra_hosts
+                 if h not in set(hosts) and host_in_scope(h, scopes)]
+    out_of_scope_ct = len(extra_hosts) - len(new_hosts)
+    if out_of_scope_ct and scopes:
+        log(f"--scope: dropped {out_of_scope_ct} CT host(s) outside "
+            f"{', '.join(scopes)}", "warn")
     if new_hosts and "dns" in enabled:
         with cf.ThreadPoolExecutor(max_workers=workers) as ex:
             list(cf.as_completed([ex.submit(src_resolve, h, collector) for h in new_hosts]))
         log(f"resolved {len(new_hosts)} CT-discovered hosts", "src")
+
+    dropped = _prune_out_of_scope(collector, scopes)
+    if dropped:
+        log(f"--scope: dropped {dropped} candidate IP(s) only seen on out-of-scope hosts",
+            "warn")
 
     return collector
 
@@ -999,10 +1084,16 @@ def run(args) -> int:
         return 2
 
     target = (args.target or "").strip().lower().rstrip(".") or None
+    scopes = parse_scopes(getattr(args, "scope", None))
     if args.outdir:
         folder = args.outdir
     else:
-        name = target or Counter(apex_of(h) for h in hosts).most_common(1)[0][0]
+        if target:
+            name = target
+        elif scopes:
+            name = scopes[0]
+        else:
+            name = Counter(apex_of(h) for h in hosts).most_common(1)[0][0]
         folder = str(Path("out") / name)
     args.outdir = folder
 
@@ -1023,7 +1114,7 @@ def run(args) -> int:
         log("API response cache disabled (--no-cache)", "info")
 
     db = build_provider_db(offline=args.offline)
-    collector = gather(hosts, keys, args.workers, enabled)
+    collector = gather(hosts, keys, args.workers, enabled, scopes=scopes)
 
     origins, shields = classify_findings(
         collector, db, use_asn=not args.no_asn, workers=args.workers)
@@ -1310,6 +1401,86 @@ def self_test() -> int:
             print(f"  [FAIL] verify early-exit: {_e}")
         finally:
             requests.get = _real_get
+
+    if requests is None:
+        print("  [SKIP] verify/concurrency/scope checks (requests missing)")
+        print(C.wrap(C.G if ok else C.R, f"\nself-test {'PASSED' if ok else 'FAILED'}"))
+        return 0 if ok else 1
+
+    def _section(name, fn):
+        nonlocal ok
+        try:
+            fn()
+            print(f"  [OK] {name}")
+        except AssertionError as _e:
+            ok = False
+            print(f"  [FAIL] {name}: {_e}")
+        except Exception as _e:  # noqa: BLE001
+            ok = False
+            print(f"  [FAIL] {name}: {type(_e).__name__}: {_e}")
+
+    # --scope: keep discovery in the target subtree instead of collapsing to apex
+    def _check_scope():
+        assert apex_of("kalsel.web.bps.go.id") == "bps.go.id"
+        sc = parse_scopes(["kalsel.web.bps.go.id"])
+        assert sc == ["kalsel.web.bps.go.id"], sc
+        assert parse_scopes(["A.TEST, *.b.test", "b.test"]) == ["a.test", "b.test"]
+        assert host_in_scope("kalsel.web.bps.go.id", sc)
+        assert host_in_scope("x.kalsel.web.bps.go.id", sc)
+        assert not host_in_scope("avior.bps.go.id", sc)
+        assert not host_in_scope("kalsel.web.bps.go.id.evil.test", sc)
+        dom, collapsed = discovery_domains(["kalsel.web.bps.go.id"], sc)
+        assert dom == ["kalsel.web.bps.go.id"] and collapsed == [], (dom, collapsed)
+        dom, collapsed = discovery_domains(["kalsel.web.bps.go.id"], [])
+        assert dom == ["bps.go.id"], dom            # legacy: full registered apex
+        assert collapsed == [("kalsel.web.bps.go.id", "bps.go.id")], collapsed
+
+        col = Collector()
+        col.add("8.8.8.8", "leak.bps.go.id", "crtsh")
+        col.add("1.1.1.1", "x.kalsel.web.bps.go.id", "dns")
+        col.add("8.8.4.4", "leak.bps.go.id", "dns")
+        col.add("8.8.4.4", "x.kalsel.web.bps.go.id", "dns")
+        dropped = _prune_out_of_scope(col, sc)
+        assert dropped == 1, dropped
+        assert set(col.findings) == {"1.1.1.1", "8.8.4.4"}, col.findings
+        assert col.findings["8.8.4.4"].hosts == {"x.kalsel.web.bps.go.id"}
+
+        calls = {"crtsh": [], "resolve": []}
+        real_fn = {n: globals()[n] for n in ("src_crtsh", "src_resolve")}
+
+        def fake_crtsh(domain, collector_, extra_hosts):
+            calls["crtsh"].append(domain)
+            extra_hosts.update({"in.kalsel.web.bps.go.id", "leak.bps.go.id"})
+
+        def fake_resolve(host, collector_):
+            calls["resolve"].append(host)
+            ip = {"kalsel.web.bps.go.id": "203.123.60.40",
+                  "in.kalsel.web.bps.go.id": "203.123.60.41",
+                  "leak.bps.go.id": "198.41.0.4"}.get(host, "9.9.9.9")
+            collector_.add(ip, host, "dns")
+
+        globals()["src_crtsh"] = fake_crtsh
+        globals()["src_resolve"] = fake_resolve
+        try:
+            col = gather(["kalsel.web.bps.go.id", "avior.bps.go.id"], {}, 1,
+                         {"dns", "crtsh"}, scopes=sc)
+            scoped_calls = {k: list(v) for k, v in calls.items()}
+            calls["crtsh"].clear(); calls["resolve"].clear()
+            legacy = gather(["kalsel.web.bps.go.id"], {}, 1,
+                            {"dns", "crtsh"}, scopes=[])
+        finally:
+            for n, fn in real_fn.items():
+                globals()[n] = fn
+        assert scoped_calls["crtsh"] == ["kalsel.web.bps.go.id"], scoped_calls
+        assert "avior.bps.go.id" not in scoped_calls["resolve"], scoped_calls
+        assert "leak.bps.go.id" not in scoped_calls["resolve"], scoped_calls
+        assert set(col.findings) == {"203.123.60.40", "203.123.60.41"}, col.findings
+        assert calls["crtsh"] == ["bps.go.id"], calls          # legacy unchanged
+        assert "leak.bps.go.id" in calls["resolve"], calls     # legacy keeps CT host
+        assert "198.41.0.4" in legacy.findings
+
+    _section("--scope pins per-apex queries + drops out-of-scope hosts", _check_scope)
+
     print(C.wrap(C.G if ok else C.R, f"\nself-test {'PASSED' if ok else 'FAILED'}"))
     return 0 if ok else 1
 
@@ -1349,6 +1520,11 @@ REMINDER: only test targets you are explicitly authorized to test.""",
     p.add_argument("-o", "--outdir", help="output directory (default: out/<target>, or out/<root-domain> when no -t). auto-created")
     p.add_argument("-c", "--config", help="subfinder provider-config.yaml (default: ~/.config/subfinder/provider-config.yaml)")
     p.add_argument("-w", "--workers", type=int, default=25, help="concurrent workers (default: 25)")
+    p.add_argument("--scope", action="append", metavar="SUFFIX",
+                   help="keep discovery inside a host subtree (repeatable and/or comma separated), "
+                        "e.g. --scope kalsel.web.bps.go.id. Per-apex sources query SUFFIX instead of "
+                        "apex_of(host); CT/extra hosts outside it are ignored. Default: off (legacy: "
+                        "query the full registered apex).")
     p.add_argument("--sources", help="comma list to enable (dns,crtsh,hackertarget,securitytrails,virustotal,shodan,censys,certspotter,dnsdumpster)")
     p.add_argument("--verify", action="store_true", help="probe each origin candidate directly and score confidence")
     p.add_argument("--min-score", type=int, default=0, help="only write candidates with confidence >= N to origin_candidates.txt (used with --verify/-t; default 0 = keep all)")
