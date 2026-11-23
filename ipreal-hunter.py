@@ -59,6 +59,7 @@ import re
 import socket
 import ssl
 import sys
+import threading as _threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -93,7 +94,7 @@ except ImportError:  # pragma: no cover
     _HAVE_MMH3 = False
 
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 UA = f"ipreal-hunter/{VERSION} (+bug-bounty recon)"
 CACHE_DIR = Path(os.path.expanduser("~/.cache/ipreal-hunter"))
 CACHE_TTL = 24 * 3600  # refresh CIDR feeds once a day
@@ -729,6 +730,17 @@ def src_dnsdumpster(domain: str, key: str, collector: Collector) -> None:
 DENY_CODES = {403, 405, 406, 429, 451, 502, 503}
 
 
+def _fmt_dur(seconds: float) -> str:
+    """Human-readable phase duration for log lines (e.g. 4m12s, 12.3s)."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, s = divmod(int(round(seconds)), 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m{s:02d}s"
+
+
 def _req_timeout(read: int, connect: Optional[int]):
     """requests timeout: split connect vs read so firewall drops fail fast."""
     if connect is None:
@@ -946,6 +958,7 @@ def classify_findings(collector: Collector, db: ProviderDB, use_asn: bool,
         return classify_ip(ip, db, use_asn=use_asn)
 
     items = list(collector.findings.items())
+    t0 = time.monotonic()
     with cf.ThreadPoolExecutor(max_workers=min(max(workers, 1), 16)) as ex:
         for (ip, f), (provider, is_cdn, method) in zip(
                 items, ex.map(_one, items)):
@@ -953,6 +966,10 @@ def classify_findings(collector: Collector, db: ProviderDB, use_asn: bool,
                 shields.append((provider, method, f))
             else:
                 origins.append((provider, method, f))
+    if items:
+        log(f"classified {len(items)} IP(s) -> {len(origins)} origin / "
+            f"{len(shields)} shield ({_fmt_dur(time.monotonic() - t0)}, "
+            f"api-workers={max(1, min(workers, 16))})", "src")
     return origins, shields
 
 
@@ -1057,6 +1074,7 @@ def gather(hosts: List[str], keys: Dict[str, Optional[str]], workers: int,
     label = "scope suffix(es)" if scopes else "apex domain(s)"
     log(f"{len(hosts)} hosts across {len(apexes)} {label}", "info")
 
+    t0 = time.monotonic()
     with cf.ThreadPoolExecutor(max_workers=api_workers) as ex:
         futs = []
         for h in hosts:
@@ -1070,8 +1088,10 @@ def gather(hosts: List[str], keys: Dict[str, Optional[str]], workers: int,
                 futs.append(ex.submit(src_virustotal, h, keys["virustotal"], collector))
         for _ in cf.as_completed(futs):
             pass
-    log(f"per-host sources done -> {len(collector.findings)} raw IPs", "src")
+    log(f"per-host sources done -> {len(collector.findings)} raw IPs "
+        f"({_fmt_dur(time.monotonic() - t0)}, api-workers={api_workers})", "src")
 
+    t0 = time.monotonic()
     with cf.ThreadPoolExecutor(max_workers=min(api_workers, 8)) as ex:
         futs = []
         for d in apexes:
@@ -1088,7 +1108,8 @@ def gather(hosts: List[str], keys: Dict[str, Optional[str]], workers: int,
         for _ in cf.as_completed(futs):
             pass
     log(f"per-apex sources done -> {len(collector.findings)} IPs, "
-        f"{len(extra_hosts)} extra hosts from CT", "src")
+        f"{len(extra_hosts)} extra hosts from CT "
+        f"({_fmt_dur(time.monotonic() - t0)})", "src")
 
     new_hosts = [h for h in extra_hosts
                  if h not in set(hosts) and host_in_scope(h, scopes)]
@@ -1097,9 +1118,11 @@ def gather(hosts: List[str], keys: Dict[str, Optional[str]], workers: int,
         log(f"--scope: dropped {out_of_scope_ct} CT host(s) outside "
             f"{', '.join(scopes)}", "warn")
     if new_hosts and "dns" in enabled:
+        t0 = time.monotonic()
         with cf.ThreadPoolExecutor(max_workers=api_workers) as ex:
             list(cf.as_completed([ex.submit(src_resolve, h, collector) for h in new_hosts]))
-        log(f"resolved {len(new_hosts)} CT-discovered hosts", "src")
+        log(f"resolved {len(new_hosts)} CT-discovered hosts "
+            f"({_fmt_dur(time.monotonic() - t0)})", "src")
 
     dropped = _prune_out_of_scope(collector, scopes)
     if dropped:
@@ -1135,7 +1158,10 @@ def run_known_origins(args, target: str, known_ips: List[str]) -> int:
     origins, shields = classify_findings(
         collector, db, use_asn=not args.no_asn, workers=args.api_workers)
 
+    t0 = time.monotonic()
     tbase = get_baseline(target, connect_timeout=args.connect_timeout)
+    log(f"baseline {target} -> {tbase.get('status')} "
+        f"({_fmt_dur(time.monotonic() - t0)})", "src")
     if not tbase.get("status"):
         log(f"could not fetch a baseline for {target} (site down / blocked?) -- "
             f"scores will be weaker", "warn")
@@ -1145,6 +1171,7 @@ def run_known_origins(args, target: str, known_ips: List[str]) -> int:
     to_probe = origins + shields
     verified: Dict[str, Tuple[int, str, str]] = {}
     log(f"probing {len(to_probe)} candidate IP(s) with Host: {target} ...", "info")
+    t0 = time.monotonic()
     with cf.ThreadPoolExecutor(max_workers=min(args.workers, 12)) as ex:
         def _dot(item):
             _p, _m, f = item
@@ -1154,6 +1181,7 @@ def run_known_origins(args, target: str, known_ips: List[str]) -> int:
                                        connect_timeout=args.connect_timeout)
         for ip, res in ex.map(_dot, to_probe):
             verified[ip] = res
+    log(f"verify {len(to_probe)} kandidat: {_fmt_dur(time.monotonic() - t0)}", "src")
     origins.sort(key=lambda t: verified.get(t[2].ip, (0, "", "UNKNOWN"))[0], reverse=True)
 
     print_report(origins, shields, verified, args)
@@ -1233,10 +1261,14 @@ def run(args) -> int:
         if target:
             log(f"confirming origin of {target}: probing {len(origins)} candidate IP(s) "
                 f"with Host: {target} ...", "info")
+            t0 = time.monotonic()
             tbase = get_baseline(target, connect_timeout=args.connect_timeout)
+            log(f"baseline {target} -> {tbase.get('status')} "
+                f"({_fmt_dur(time.monotonic() - t0)})", "src")
             if not tbase.get("status"):
                 log(f"could not fetch a baseline for {target} (site down / blocked?) -- "
                     f"scores will be weaker", "warn")
+            t0 = time.monotonic()
             with cf.ThreadPoolExecutor(max_workers=min(args.workers, 12)) as ex:
                 def _dot(item):
                     _p, _m, f = item
@@ -1246,9 +1278,13 @@ def run(args) -> int:
                                                connect_timeout=args.connect_timeout)
                 for ip, res in ex.map(_dot, origins):
                     verified[ip] = res
+            log(f"verify {len(origins)} kandidat: {_fmt_dur(time.monotonic() - t0)}", "src")
         else:
             log(f"verifying {len(origins)} origin candidates (direct-IP probe)...", "info")
             baselines: Dict[str, dict] = {}
+            base_secs = {"t": 0.0}
+            base_lock = _threading.Lock()
+            t0 = time.monotonic()
             with cf.ThreadPoolExecutor(max_workers=min(args.workers, 12)) as ex:
                 def _do(item):
                     provider, method, f = item
@@ -1256,8 +1292,11 @@ def run(args) -> int:
                     if not host:
                         return f.ip, (0, "no-host", "UNKNOWN")
                     if host not in baselines:
+                        tb = time.monotonic()
                         baselines[host] = get_baseline(
                             host, connect_timeout=args.connect_timeout)
+                        with base_lock:
+                            base_secs["t"] += time.monotonic() - tb
                     # An IP that IS the host's current A/AAAA record trivially
                     # "serves" it; that is not a hidden origin. Keep the probe
                     # (reachability is still useful) but say so and keep it out
@@ -1273,6 +1312,8 @@ def run(args) -> int:
                     return f.ip, res
                 for ip, res in ex.map(_do, origins):
                     verified[ip] = res
+            log(f"baseline {len(baselines)} host(s): {_fmt_dur(base_secs['t'])}", "src")
+            log(f"verify {len(origins)} kandidat: {_fmt_dur(time.monotonic() - t0)}", "src")
             n_cdns = sum(1 for v in verified.values() if "current-dns" in v[1])
             if n_cdns:
                 log(f"{n_cdns} candidate(s) are the host's current DNS record "
@@ -1876,6 +1917,9 @@ def self_test() -> int:
             stop2.set()
 
     _section("TLS SAN matching (wildcard-aware, live handshake on 127.0.0.1)", _check_san)
+
+    assert _fmt_dur(4.2) == "4.2s" and _fmt_dur(252) == "4m12s", _fmt_dur(252)
+    print("  [OK] phase duration formatting")
 
     print(C.wrap(C.G if ok else C.R, f"\nself-test {'PASSED' if ok else 'FAILED'}"))
     return 0 if ok else 1
