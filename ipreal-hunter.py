@@ -496,6 +496,11 @@ class Finding:
 class Collector:
     def __init__(self):
         self.findings: Dict[str, Finding] = {}
+        # (ip, host) pairs that are the host's CURRENT A/AAAA record. Kept
+        # separately because Finding only stores a flat host/source union;
+        # verification needs the pair to tell "serves its own DNS record"
+        # apart from "serves a host it is not the DNS record of".
+        self.dns_hosts: Set[Tuple[str, str]] = set()
 
     def add(self, ip: str, host: str, source: str) -> None:
         ip = ip.strip()
@@ -559,6 +564,8 @@ def src_resolve(host: str, collector: Collector) -> None:
             pass
     for ip in records:
         collector.add(ip, host, "dns")
+        if _valid_public_ip(ip):
+            collector.dns_hosts.add((ip, host))
 
 
 def src_crtsh(domain: str, collector: Collector, extra_hosts: Set[str]) -> None:
@@ -1194,12 +1201,26 @@ def run(args) -> int:
                     if host not in baselines:
                         baselines[host] = get_baseline(
                             host, connect_timeout=args.connect_timeout)
-                    return f.ip, verify_origin(f.ip, host, baselines[host],
-                                               timeout=args.verify_timeout,
-                                               probe_path=args.probe_path,
-                                               connect_timeout=args.connect_timeout)
+                    # An IP that IS the host's current A/AAAA record trivially
+                    # "serves" it; that is not a hidden origin. Keep the probe
+                    # (reachability is still useful) but say so and keep it out
+                    # of accessible_origin.txt.
+                    res = verify_origin(f.ip, host, baselines[host],
+                                        timeout=args.verify_timeout,
+                                        probe_path=args.probe_path,
+                                        connect_timeout=args.connect_timeout)
+                    if (f.ip, host) in collector.dns_hosts:
+                        score, note, verdict = res
+                        note = "current-dns" if not note else f"current-dns,{note}"
+                        res = (score, note, verdict)
+                    return f.ip, res
                 for ip, res in ex.map(_do, origins):
                     verified[ip] = res
+            n_cdns = sum(1 for v in verified.values() if "current-dns" in v[1])
+            if n_cdns:
+                log(f"{n_cdns} candidate(s) are the host's current DNS record "
+                    f"(note: current-dns) -- not treated as hidden origins",
+                    "warn")
         origins.sort(key=lambda t: verified.get(t[2].ip, (0, "", "UNKNOWN"))[0], reverse=True)
 
     print_report(origins, shields, verified, args)
@@ -1274,9 +1295,18 @@ def write_outputs(origins, shields, verified, args) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     get_v = lambda f: verified.get(f.ip, (0, "", "UNKNOWN"))
+
+    def _is_current_dns(f) -> bool:
+        return "current-dns" in (get_v(f)[1] or "")
+
     sel = [f for _, _, f in origins if (not verified) or get_v(f)[2] == "ACCESS" or get_v(f)[0] >= args.min_score]
-    acc = [f for _, _, f in origins if get_v(f)[2] == "ACCESS"]
-    reached = [f for _, _, f in origins if get_v(f)[2] in ("ACCESS", "REACHED")]
+    # An IP that is the host's own current A/AAAA record is not a hidden
+    # origin: keep it visible (it IS reachable) but out of the two
+    # "origin you can pivot through via Host:" lists.
+    acc = [f for _, _, f in origins
+           if get_v(f)[2] == "ACCESS" and not _is_current_dns(f)]
+    reached = [f for _, _, f in origins
+               if get_v(f)[2] in ("ACCESS", "REACHED") and not _is_current_dns(f)]
 
     for name, items in (("origin_candidates.txt", sel),
                         ("accessible_origin.txt", acc),
@@ -1669,6 +1699,59 @@ def self_test() -> int:
         assert 0.9 <= cert_elapsed < 1.8, cert_elapsed   # honours --connect-timeout, not 8s
 
     _section("connect/read timeout split + fast-fail", _check_timeouts)
+
+    # current-dns (no -t): honest note, kept out of hidden-origin lists
+    def _check_current_dns():
+        d = tempfile.mkdtemp(prefix="ipreal-cdns-test-")
+        inp = os.path.join(d, "subs.txt")
+        host = "app.kalsel.web.bps.go.id"
+        Path(inp).write_text(host + "\n", encoding="utf-8")
+        col = Collector()
+        col.add("8.8.8.8", host, "dns")
+        col.dns_hosts.add(("8.8.8.8", host))
+        col.add("1.1.1.1", host, "virustotal")
+
+        def fake_get2(url, **kw):
+            return _FakeResp(200)
+
+        saved = {n: globals()[n] for n in ("gather", "print_report", "_cert_matches")}
+        globals()["gather"] = lambda *a, **k: col
+        globals()["print_report"] = lambda *a, **k: None
+        globals()["_cert_matches"] = lambda *a, **k: False
+        requests.get = fake_get2
+        try:
+            out = os.path.join(d, "out")
+            args = build_parser().parse_args([
+                "-i", inp, "-o", out, "-c", os.path.join(d, "no.yaml"),
+                "--verify", "--offline", "--no-asn", "--sources", "dns", "--no-cache"])
+            run(args)
+            acc = (Path(out) / "accessible_origin.txt").read_text().split()
+            reached = (Path(out) / "reachable_origin.txt").read_text().split()
+            sel = (Path(out) / "origin_candidates.txt").read_text().split()
+            rep = json.loads((Path(out) / "report.json").read_text())
+            args_t = build_parser().parse_args([
+                "-i", inp, "-o", os.path.join(d, "out_t"), "-t", host,
+                "-c", os.path.join(d, "no.yaml"), "--offline", "--no-asn",
+                "--sources", "dns", "--no-cache"])
+            args_t.outdir = os.path.join(d, "out_t")
+            run(args_t)
+            rep_t = json.loads((Path(d, "out_t") / "report.json").read_text())
+        finally:
+            for n, fn in saved.items():
+                globals()[n] = fn
+            requests.get = _real_get
+        notes = {e["ip"]: e["confidence_note"] for e in rep["origin_candidates"]}
+        assert acc == ["1.1.1.1"], acc                 # hidden origin only
+        assert reached == ["1.1.1.1"], reached
+        assert "8.8.8.8" in sel and "1.1.1.1" in sel   # still visible as reachable
+        assert notes["8.8.8.8"].startswith("current-dns"), notes
+        assert "current-dns" not in notes["1.1.1.1"], notes
+        verdicts = {e["ip"]: e["verdict"] for e in rep["origin_candidates"]}
+        assert verdicts["8.8.8.8"] == "ACCESS", verdicts   # verdict itself unchanged
+        notes_t = {e["ip"]: e["confidence_note"] for e in rep_t["origin_candidates"]}
+        assert all("current-dns" not in n for n in notes_t.values()), notes_t
+
+    _section("current-dns marked, excluded from accessible/reachable (no -t)", _check_current_dns)
 
     print(C.wrap(C.G if ok else C.R, f"\nself-test {'PASSED' if ok else 'FAILED'}"))
     return 0 if ok else 1
