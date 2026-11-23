@@ -722,20 +722,38 @@ def src_dnsdumpster(domain: str, key: str, collector: Collector) -> None:
 DENY_CODES = {403, 405, 406, 429, 451, 502, 503}
 
 
-def get_baseline(host: str, timeout: int = 15) -> dict:
+def _req_timeout(read: int, connect: Optional[int]):
+    """requests timeout: split connect vs read so firewall drops fail fast."""
+    if connect is None:
+        return read
+    return (max(1, int(connect)), max(1, int(read)))
+
+
+def _is_connect_timeout(exc: BaseException) -> bool:
+    """True only for TCP connect timeouts (SYN dropped), not read timeouts."""
+    names = {c.__name__ for c in type(exc).__mro__}
+    return bool(names & {"ConnectTimeout", "ConnectTimeoutError"})
+
+
+def get_baseline(host: str, timeout: int = 15,
+                 connect_timeout: Optional[int] = None) -> dict:
     base = {"title": None, "len": None, "status": None, "server": None}
     for scheme in ("https", "http"):
         try:
-            r = http_get(f"{scheme}://{host}/", timeout=timeout)
+            r = http_get(f"{scheme}://{host}/",
+                         timeout=_req_timeout(timeout, connect_timeout))
             base["status"] = r.status_code
             base["len"] = len(r.content)
             base["server"] = r.headers.get("Server")
             m = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.I | re.S)
             base["title"] = m.group(1).strip()[:120] if m else None
             return base
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            if _is_connect_timeout(exc):
+                break  # 443 SYN dropped -> 80 will hang the same way
             continue
     return base
+
 
 
 def _verdict_for(score: int, reached: bool, redirect_host: Optional[str],
@@ -752,7 +770,8 @@ def _verdict_for(score: int, reached: bool, redirect_host: Optional[str],
 
 
 def verify_origin(ip: str, host: str, baseline: dict, timeout: int = 12,
-                  probe_path: str = "/") -> Tuple[int, str, str]:
+                  probe_path: str = "/",
+                  connect_timeout: Optional[int] = None) -> Tuple[int, str, str]:
     if requests is None:
         return 0, "requests missing", "BLOCKED"
     notes = []
@@ -760,17 +779,26 @@ def verify_origin(ip: str, host: str, baseline: dict, timeout: int = 12,
     reached = False
     codes: List[int] = []
     redirect_host: Optional[str] = None
+    connect_dropped = False
     for scheme, port in (("https", 443), ("http", 80)):
+        if scheme == "http" and connect_dropped:
+            # TCP connect to this IP already timed out on 443: the same
+            # firewall drop usually swallows 80 too, and retrying would burn
+            # another full connect budget for nothing.
+            notes.append("connect-timeout")
+            continue
         url = f"{scheme}://{ip}:{port}{probe_path}"
         try:
             # direct connection only -- never route the probe through a proxy
             r = requests.get(
-                url, timeout=timeout, verify=False,
+                url, timeout=_req_timeout(timeout, connect_timeout), verify=False,
                 headers={"Host": host, "User-Agent": UA},
                 allow_redirects=False,
                 proxies={"http": None, "https": None},
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            if _is_connect_timeout(exc):
+                connect_dropped = True
             continue
         reached = True
         codes.append(r.status_code)
@@ -800,7 +828,7 @@ def verify_origin(ip: str, host: str, baseline: dict, timeout: int = 12,
                 score = max(score, 80); notes.append("body-size-match")
         if scheme == "https":
             try:
-                if _cert_matches(ip, port, host):
+                if _cert_matches(ip, port, host, connect_timeout=connect_timeout):
                     score = max(score, 85); notes.append("tls-san-match")
             except Exception:  # noqa: BLE001
                 pass
@@ -814,11 +842,13 @@ def verify_origin(ip: str, host: str, baseline: dict, timeout: int = 12,
     return score, note, verdict
 
 
-def _cert_matches(ip: str, port: int, host: str) -> bool:
+def _cert_matches(ip: str, port: int, host: str,
+                  connect_timeout: Optional[int] = None) -> bool:
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    with socket.create_connection((ip, port), timeout=8) as sock:
+    sock_timeout = connect_timeout if connect_timeout else 8
+    with socket.create_connection((ip, port), timeout=sock_timeout) as sock:
         with ctx.wrap_socket(sock, server_hostname=host) as ssock:
             cert = ssock.getpeercert()
     if not cert:
@@ -1041,7 +1071,7 @@ def run_known_origins(args, target: str, known_ips: List[str]) -> int:
     origins, shields = classify_findings(
         collector, db, use_asn=not args.no_asn, workers=args.api_workers)
 
-    tbase = get_baseline(target)
+    tbase = get_baseline(target, connect_timeout=args.connect_timeout)
     if not tbase.get("status"):
         log(f"could not fetch a baseline for {target} (site down / blocked?) -- "
             f"scores will be weaker", "warn")
@@ -1056,7 +1086,8 @@ def run_known_origins(args, target: str, known_ips: List[str]) -> int:
             _p, _m, f = item
             return f.ip, verify_origin(f.ip, target, tbase,
                                        timeout=args.verify_timeout,
-                                       probe_path=args.probe_path)
+                                       probe_path=args.probe_path,
+                                       connect_timeout=args.connect_timeout)
         for ip, res in ex.map(_dot, to_probe):
             verified[ip] = res
     origins.sort(key=lambda t: verified.get(t[2].ip, (0, "", "UNKNOWN"))[0], reverse=True)
@@ -1138,7 +1169,7 @@ def run(args) -> int:
         if target:
             log(f"confirming origin of {target}: probing {len(origins)} candidate IP(s) "
                 f"with Host: {target} ...", "info")
-            tbase = get_baseline(target)
+            tbase = get_baseline(target, connect_timeout=args.connect_timeout)
             if not tbase.get("status"):
                 log(f"could not fetch a baseline for {target} (site down / blocked?) -- "
                     f"scores will be weaker", "warn")
@@ -1147,7 +1178,8 @@ def run(args) -> int:
                     _p, _m, f = item
                     return f.ip, verify_origin(f.ip, target, tbase,
                                                timeout=args.verify_timeout,
-                                               probe_path=args.probe_path)
+                                               probe_path=args.probe_path,
+                                               connect_timeout=args.connect_timeout)
                 for ip, res in ex.map(_dot, origins):
                     verified[ip] = res
         else:
@@ -1160,10 +1192,12 @@ def run(args) -> int:
                     if not host:
                         return f.ip, (0, "no-host", "UNKNOWN")
                     if host not in baselines:
-                        baselines[host] = get_baseline(host)
+                        baselines[host] = get_baseline(
+                            host, connect_timeout=args.connect_timeout)
                     return f.ip, verify_origin(f.ip, host, baselines[host],
                                                timeout=args.verify_timeout,
-                                               probe_path=args.probe_path)
+                                               probe_path=args.probe_path,
+                                               connect_timeout=args.connect_timeout)
                 for ip, res in ex.map(_do, origins):
                     verified[ip] = res
         origins.sort(key=lambda t: verified.get(t[2].ip, (0, "", "UNKNOWN"))[0], reverse=True)
@@ -1565,6 +1599,77 @@ def self_test() -> int:
 
     _section("--api-workers (sources) vs -w (verify) concurrency", _check_pools)
 
+    # connect timeout: one fast-failing probe, never verify-timeout x 2
+    def _check_timeouts():
+        seen = []
+
+        def hang_get(url, **kw):
+            seen.append((url, kw.get("timeout")))
+            time.sleep(0.4)
+            raise requests.exceptions.ConnectTimeout("connect timed out")
+
+        requests.get = hang_get
+        try:
+            t0 = time.monotonic()
+            sc, note, verdict = verify_origin(
+                "203.123.60.49", "kalsel.web.bps.go.id", {},
+                timeout=12, connect_timeout=1)
+            elapsed = time.monotonic() - t0
+        finally:
+            requests.get = _real_get
+        assert seen and len(seen) == 1, seen          # http not retried
+        assert seen[0][1] == (1, 12), seen            # (connect, read)
+        assert sc == 0 and verdict == "BLOCKED", (sc, verdict)
+        assert "connect-timeout" in note, note
+        assert elapsed < 0.9, elapsed                 # one connect budget, not 2x
+
+        base_calls = []
+
+        def hard_drop(url, **kw):
+            base_calls.append(url)
+            raise requests.exceptions.ConnectTimeout("drop")
+
+        requests.get = hard_drop
+        try:
+            base = get_baseline("kalsel.web.bps.go.id", timeout=12, connect_timeout=1)
+        finally:
+            requests.get = _real_get
+        assert len(base_calls) == 1 and base["status"] is None, base_calls
+
+        def read_slow(url, **kw):
+            if url.startswith("https"):
+                raise requests.exceptions.ReadTimeout("slow")
+            return _FakeResp(200)
+
+        requests.get = read_slow
+        try:
+            base2 = get_baseline("kalsel.web.bps.go.id", timeout=12, connect_timeout=1)
+        finally:
+            requests.get = _real_get
+        assert base2["status"] == 200, base2          # read timeout still tries http
+
+        real_cc = socket.create_connection
+
+        def slow_connect(addr, timeout=None, **kw):
+            time.sleep(timeout or 0)
+            raise TimeoutError("timed out")
+
+        socket.create_connection = slow_connect
+        try:
+            t0 = time.monotonic()
+            try:
+                hit = _cert_matches("203.123.60.49", 443, "kalsel.web.bps.go.id",
+                                    connect_timeout=1)
+            except (TimeoutError, OSError):
+                hit = None   # connect failure is fine; we only time it
+            cert_elapsed = time.monotonic() - t0
+        finally:
+            socket.create_connection = real_cc
+        assert hit is not True, hit
+        assert 0.9 <= cert_elapsed < 1.8, cert_elapsed   # honours --connect-timeout, not 8s
+
+    _section("connect/read timeout split + fast-fail", _check_timeouts)
+
     print(C.wrap(C.G if ok else C.R, f"\nself-test {'PASSED' if ok else 'FAILED'}"))
     return 0 if ok else 1
 
@@ -1614,7 +1719,9 @@ REMINDER: only test targets you are explicitly authorized to test.""",
     p.add_argument("--verify", action="store_true", help="probe each origin candidate directly and score confidence")
     p.add_argument("--min-score", type=int, default=0, help="only write candidates with confidence >= N to origin_candidates.txt (used with --verify/-t; default 0 = keep all)")
     p.add_argument("--probe-path", default="/", help="path probed during direct-IP verification (default: /)")
-    p.add_argument("--verify-timeout", type=int, default=12, help="per-IP verification connect/read timeout in seconds (default: 12)")
+    p.add_argument("--verify-timeout", type=int, default=12, help="per-IP verification READ timeout in seconds (default: 12)")
+    p.add_argument("--connect-timeout", type=int, default=4,
+                   help="TCP connect timeout in seconds for verify/baseline probes; keeps firewall-dropped IPs cheap. default: 4")
     p.add_argument("--no-cache", action="store_true", help="disable API response cache (always re-query history sources)")
     p.add_argument("--cache-ttl", type=int, default=7 * 86400, help="API cache TTL in seconds (default: 604800 = 7d)")
     p.add_argument("--no-asn", action="store_true", help="disable Team Cymru ASN fallback classification")
