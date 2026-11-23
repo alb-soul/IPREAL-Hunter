@@ -80,6 +80,69 @@ With `-t` set, `ipreal-hunter`:
 `-t` implies `--verify`. Without `-t`, `--verify` instead tests each IP against
 the host it was discovered from (useful when you care about many hosts at once).
 
+### `current-dns` caveat (no `-t`)
+
+When verifying without `-t`, an IP that is *already the host's current A/AAAA
+record* trivially "serves" that host — that is not a hidden origin, it is just
+the address DNS returns. Those candidates are still probed (reachability is
+useful) and still appear in `origin_candidates.txt` / `report.json`, but their
+`confidence_note` starts with `current-dns` and they are **left out of**
+`accessible_origin.txt` and `reachable_origin.txt` so you don't chase a
+"bypass" that is really the public DNS entry. Candidates from history sources,
+and every `-t` run, are unaffected.
+
+## Scoping discovery (`--scope`)
+
+Per-apex sources (crt.sh, certspotter, dnsdumpster, shodan, censys) need a
+domain to query. By default it is `apex_of()` of each input host, computed from
+the last two labels plus a small 2-letter-second-level table (`co.id`, `go.id`,
+`ac.id`, …). On a deep host that can widen the hunt considerably: for
+`kalsel.web.bps.go.id`, `apex_of()` yields `bps.go.id`, so CT and passive-DNS
+sources return *every* BPS host and their IPs, and all of those IPs get probed.
+
+Use `--scope` to keep discovery inside the subtree you actually own in-scope:
+
+```bash
+python3 ipreal-hunter.py -i subs-alive.txt -o out_ip/ --scope kalsel.web.bps.go.id --verify
+# repeatable and/or comma separated:
+python3 ipreal-hunter.py -i subs.txt --scope a.example.com --scope b.example.com
+```
+
+With `--scope SUFFIX`:
+
+1. per-apex sources query `SUFFIX` itself (`crt.sh?q=%.kalsel.web.bps.go.id`),
+2. hosts discovered via CT/other sources are only used when they are `SUFFIX`
+   or end in `.SUFFIX` (input hosts outside it are skipped too),
+3. candidate IPs whose every known host is outside `SUFFIX` are neither probed
+   nor written to any output.
+
+`--scope` is off by default, so existing callers keep the old apex behaviour;
+when it is off and `apex_of()` shortens an input host, a warning is logged
+naming the host and the apex it collapsed to.
+
+## Verification timeouts
+
+`--verify-timeout` is the **read** timeout (default 12s) and
+`--connect-timeout` is the **TCP connect** timeout (default 4s). They are
+passed to `requests` as `(connect, read)`, so an IP whose 443 is silently
+dropped by a firewall costs ~4s instead of a full 12s — and when the 443
+connect times out, the http probe for that same IP is skipped entirely rather
+than repeating the wait. Baseline fetches use the same pair. A refused or
+answered connection still falls through to http exactly as before, so normal
+verdicts are unchanged.
+
+## Concurrency: `-w` vs `--api-workers`
+
+Two phases, two knobs:
+
+| Knob | Default | Governs |
+|---|---|---|
+| `-w, --workers` | 25 | requests that touch the target / candidate IPs: baseline fetch + direct-IP verification |
+| `--api-workers` | 8 | history and DNS sources (crtsh, certspotter, dnsdumpster, shodan, censys, securitytrails, virustotal, hackertarget, direct DNS) and the Team Cymru classify step — no target contact |
+
+So a rate-limited `-w 1` run no longer serialises the API phase: history
+lookups still run 8-wide while probes to the target stay one-at-a-time.
+
 ## Retesting a host against KNOWN origin IPs (`--origin-ips`)
 
 Discovery (step above) gives you `out_ip/origin_candidates.txt`. Later, when
@@ -152,23 +215,62 @@ python3 ipreal-hunter.py --self-test
 -i, --input     hosts file, one per line (subfinder output)
 -t, --target    the ONE host you want the origin of; probes every candidate
                 IP with Host: <target> and scores it. Implies --verify
--o, --outdir    output dir (default: out/<target>, or out/<root-domain>
-                when no -t). Created automatically.
+-o, --outdir    output dir (default: out/<target>, or out/<first --scope>,
+                or out/<root-domain> when no -t)
 -c, --config    path to subfinder provider-config.yaml
--w, --workers   concurrency (default 25)
+-w, --workers   concurrency for requests that TOUCH the target / candidate
+                IPs (baseline + verify). default 25
+--api-workers   concurrency for history/DNS sources + Cymru classify (never
+                contacts the target). default 8
+--scope SUFFIX  keep discovery inside a host subtree: per-apex sources query
+                SUFFIX, CT/extra hosts outside it are ignored, and IPs only
+                seen on out-of-scope hosts are dropped. Repeatable/comma.
+                default off (legacy: query the full registered apex)
 --sources       comma list: dns,crtsh,hackertarget,securitytrails,
                 virustotal,shodan,censys,certspotter,dnsdumpster
 --verify        probe candidates directly and score confidence
 --min-score N   only write candidates with confidence >= N to
                 origin_candidates.txt (default 0 = keep all)
 --probe-path    path probed on direct-IP verification (default: /)
---verify-timeout  per-IP verification timeout in seconds (default: 12)
+--verify-timeout  per-IP verification READ timeout in seconds (default: 12)
+--connect-timeout TCP connect timeout in seconds for verify/baseline probes
+                (default: 4) -- keeps firewall-dropped IPs cheap
 --no-cache        disable API response cache (always re-query)
 --cache-ttl       API cache TTL in seconds (default: 604800 = 7d)
 --no-asn        disable Team Cymru ASN fallback
 --offline       skip live CIDR feeds (ASN-only)
 --self-test     run offline logic check
 ```
+
+## Changelog
+
+### 1.5.0
+
+- **new `--scope SUFFIX`** (repeatable/comma): per-apex sources query the given
+  suffix instead of `apex_of(host)`, CT/extra hosts outside it are ignored and
+  candidates seen only on out-of-scope hosts are neither probed nor written.
+  Fixes a deep host (`kalsel.web.bps.go.id`) collapsing to `bps.go.id` and
+  pulling in every host of the registered apex. Default off = legacy behaviour;
+  a warning now names the collapse when it happens.
+- **new `--api-workers N`** (default 8): history/DNS sources + Cymru classify no
+  longer share `-w` with probe concurrency, so a rate-limited `-w 1` run is no
+  longer fully serial. `-w` still bounds every connection to the target/candidate
+  IPs.
+- **new `--connect-timeout N`** (default 4): verify/baseline use
+  `requests timeout=(connect, read)`; a connect timeout on 443 skips the http
+  retry for that IP. Firewall-dropped candidates now cost seconds, not twice the
+  read timeout. Verdicts for normal (answered/refused) targets are unchanged.
+- **fix: trivial `ACCESS` without `-t`** — an IP that is the host's own current
+  A/AAAA record is now noted `current-dns` and excluded from
+  `accessible_origin.txt` / `reachable_origin.txt` (still listed in
+  `origin_candidates.txt` and `report.json`).
+- **fix: TLS SAN matching** — certs are matched against the host with proper
+  wildcard rules (exact, or `*.parent` covering one label) instead of a
+  substring test on the last two labels, which made any `*.go.id` certificate
+  match `*.bps.go.id` hosts. DER is decoded as well, since `getpeercert()`
+  returns an empty dict under `CERT_NONE`.
+- **phase timings in the log** for per-host sources, per-apex sources, CT host
+  resolution, classify, baseline and verify.
 
 ## API keys
 
