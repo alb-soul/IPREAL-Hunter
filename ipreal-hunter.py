@@ -849,6 +849,71 @@ def verify_origin(ip: str, host: str, baseline: dict, timeout: int = 12,
     return score, note, verdict
 
 
+def san_matches_host(san: str, host: str) -> bool:
+    """True if one certificate SAN name covers `host`.
+
+    Exact match, or a wildcard `*.parent` that covers `parent` itself and
+    exactly one label below it. Crucially, `*.go.id` does NOT cover
+    `kalsel.web.bps.go.id` -- two trailing labels are not a domain boundary.
+    """
+    san = (san or "").strip().lower().rstrip(".")
+    host = (host or "").strip().lower().rstrip(".")
+    if not san or not host:
+        return False
+    if san == host:
+        return True
+    if not san.startswith("*."):
+        return False
+    parent = san[2:]
+    if not parent:
+        return False
+    if host == parent:
+        return True
+    if not host.endswith("." + parent):
+        return False
+    left = host[: -(len(parent) + 1)]
+    return bool(left) and "." not in left
+
+
+def _cert_san_names(ssock) -> List[str]:
+    """DNS SANs from a negotiated TLS socket (getpeercert() alone is empty
+    under CERT_NONE, so decode the DER certificate too)."""
+    names: List[str] = []
+    cert = {}
+    try:
+        cert = ssock.getpeercert() or {}
+    except Exception:  # noqa: BLE001
+        cert = {}
+    for typ, val in cert.get("subjectAltName", ()):
+        if typ == "DNS":
+            names.append(val.lower())
+    if names:
+        return names
+    der = None
+    try:
+        der = ssock.getpeercert(binary_form=True)
+    except Exception:  # noqa: BLE001
+        der = None
+    if der and hasattr(ssl, "_ssl") and hasattr(ssl._ssl, "_test_decode_cert"):
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".pem")
+        try:
+            with os.fdopen(fd, "w", encoding="ascii") as fh:
+                fh.write(ssl.DER_cert_to_PEM_cert(der))
+            decoded = ssl._ssl._test_decode_cert(path)  # type: ignore[attr-defined]
+            for typ, val in decoded.get("subjectAltName", ()):
+                if typ == "DNS":
+                    names.append(val.lower())
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    return names
+
+
 def _cert_matches(ip: str, port: int, host: str,
                   connect_timeout: Optional[int] = None) -> bool:
     ctx = ssl.create_default_context()
@@ -857,16 +922,8 @@ def _cert_matches(ip: str, port: int, host: str,
     sock_timeout = connect_timeout if connect_timeout else 8
     with socket.create_connection((ip, port), timeout=sock_timeout) as sock:
         with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-            cert = ssock.getpeercert()
-    if not cert:
-        return False
-    names = []
-    for typ, val in cert.get("subjectAltName", ()):
-        if typ == "DNS":
-            names.append(val.lower())
-    base = host.split(".")[-2:] if host.count(".") >= 1 else [host]
-    apex = ".".join(base)
-    return any(apex in n for n in names)
+            names = _cert_san_names(ssock)
+    return any(san_matches_host(n, host) for n in names)
 
 
 # ----------------------------------------------------------------------------
@@ -1752,6 +1809,73 @@ def self_test() -> int:
         assert all("current-dns" not in n for n in notes_t.values()), notes_t
 
     _section("current-dns marked, excluded from accessible/reachable (no -t)", _check_current_dns)
+
+    # SAN matching: correct wildcard semantics, not "last two labels"
+    def _check_san():
+        assert not san_matches_host("*.go.id", "kalsel.web.bps.go.id")
+        assert san_matches_host("*.kalsel.web.bps.go.id", "kalsel.web.bps.go.id")
+        assert san_matches_host("*.kalsel.web.bps.go.id", "a.kalsel.web.bps.go.id")
+        assert not san_matches_host("*.kalsel.web.bps.go.id", "a.b.kalsel.web.bps.go.id")
+        assert san_matches_host("kalsel.web.bps.go.id", "kalsel.web.bps.go.id")
+        assert not san_matches_host("bps.go.id", "kalsel.web.bps.go.id")
+        assert san_matches_host("*.bps.go.id", "avior.bps.go.id")
+        assert san_matches_host("KALSEL.WEB.BPS.GO.ID.", "kalsel.web.bps.go.id")
+        assert san_matches_host("*.web.bps.go.id", "kalsel.web.bps.go.id")
+        assert not san_matches_host("*.web.bps.go.id", "a.kalsel.web.bps.go.id")
+        assert not san_matches_host("", "x.test")
+
+        import shutil as _sh2
+        import subprocess as _sp
+        import threading as _th
+        if not _sh2.which("openssl"):
+            print("  [SKIP] real TLS SAN handshake (openssl not available)")
+            return
+
+        def _serve(sans):
+            dd = tempfile.mkdtemp()
+            key, crt = os.path.join(dd, "k.pem"), os.path.join(dd, "c.pem")
+            _sp.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                     "-keyout", key, "-out", crt, "-days", "1", "-subj", "/CN=selftest",
+                     "-addext", "subjectAltName=" + ",".join("DNS:" + s for s in sans)],
+                    check=True, capture_output=True)
+            sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            sctx.load_cert_chain(crt, key)
+            srv = socket.socket()
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(4)
+            srv.settimeout(0.2)
+            stop = _th.Event()
+
+            def _loop():
+                while not stop.is_set():
+                    try:
+                        conn, _ = srv.accept()
+                    except (socket.timeout, OSError):
+                        continue
+                    try:
+                        with sctx.wrap_socket(conn, server_side=True) as s:
+                            s.recv(16)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    finally:
+                        conn.close()
+                srv.close()
+
+            _th.Thread(target=_loop, daemon=True).start()
+            return srv.getsockname()[1], stop
+
+        p_broad, stop1 = _serve(["*.go.id", "go.id"])
+        p_narrow, stop2 = _serve(["*.kalsel.web.bps.go.id"])
+        try:
+            assert _cert_matches("127.0.0.1", p_broad,
+                                 "kalsel.web.bps.go.id", connect_timeout=3) is False
+            assert _cert_matches("127.0.0.1", p_narrow,
+                                 "kalsel.web.bps.go.id", connect_timeout=3) is True
+        finally:
+            stop1.set()
+            stop2.set()
+
+    _section("TLS SAN matching (wildcard-aware, live handshake on 127.0.0.1)", _check_san)
 
     print(C.wrap(C.G if ok else C.R, f"\nself-test {'PASSED' if ok else 'FAILED'}"))
     return 0 if ok else 1
