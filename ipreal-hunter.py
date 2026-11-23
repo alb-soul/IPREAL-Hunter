@@ -841,7 +841,8 @@ def classify_findings(collector: Collector, db: ProviderDB, use_asn: bool,
     """Split collected IPs into (origins, shields).
 
     Cymru ASN lookups can stall per-IP on filtered networks, so run them
-    concurrently instead of sequentially.
+    concurrently instead of sequentially. This phase only talks to DNS (no
+    target contact), so callers pass --api-workers rather than -w.
     """
     origins: List[Tuple[str, str, Finding]] = []
     shields: List[Tuple[str, str, Finding]] = []
@@ -931,8 +932,16 @@ def _prune_out_of_scope(collector: Collector, scopes: List[str]) -> int:
 
 
 def gather(hosts: List[str], keys: Dict[str, Optional[str]], workers: int,
-           enabled: Set[str], scopes: Optional[List[str]] = None) -> Collector:
+           enabled: Set[str], scopes: Optional[List[str]] = None,
+           api_workers: Optional[int] = None) -> Collector:
+    """Collect candidate IPs.
+
+    `workers` (-w) bounds concurrent requests to the target / candidate IPs;
+    `api_workers` (--api-workers) bounds the history + DNS source phase, which
+    never touches the target and should not be throttled by a rate-limited -w.
+    """
     scopes = scopes or []
+    api_workers = max(1, api_workers if api_workers is not None else workers)
     collector = Collector()
     if scopes:
         kept_hosts = [h for h in hosts if host_in_scope(h, scopes)]
@@ -954,7 +963,7 @@ def gather(hosts: List[str], keys: Dict[str, Optional[str]], workers: int,
     label = "scope suffix(es)" if scopes else "apex domain(s)"
     log(f"{len(hosts)} hosts across {len(apexes)} {label}", "info")
 
-    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+    with cf.ThreadPoolExecutor(max_workers=api_workers) as ex:
         futs = []
         for h in hosts:
             if "dns" in enabled:
@@ -969,7 +978,7 @@ def gather(hosts: List[str], keys: Dict[str, Optional[str]], workers: int,
             pass
     log(f"per-host sources done -> {len(collector.findings)} raw IPs", "src")
 
-    with cf.ThreadPoolExecutor(max_workers=min(workers, 8)) as ex:
+    with cf.ThreadPoolExecutor(max_workers=min(api_workers, 8)) as ex:
         futs = []
         for d in apexes:
             if "crtsh" in enabled:
@@ -994,7 +1003,7 @@ def gather(hosts: List[str], keys: Dict[str, Optional[str]], workers: int,
         log(f"--scope: dropped {out_of_scope_ct} CT host(s) outside "
             f"{', '.join(scopes)}", "warn")
     if new_hosts and "dns" in enabled:
-        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        with cf.ThreadPoolExecutor(max_workers=api_workers) as ex:
             list(cf.as_completed([ex.submit(src_resolve, h, collector) for h in new_hosts]))
         log(f"resolved {len(new_hosts)} CT-discovered hosts", "src")
 
@@ -1030,7 +1039,7 @@ def run_known_origins(args, target: str, known_ips: List[str]) -> int:
     log(f"{len(collector.findings)} known origin IP(s) to verify against {target}", "info")
 
     origins, shields = classify_findings(
-        collector, db, use_asn=not args.no_asn, workers=args.workers)
+        collector, db, use_asn=not args.no_asn, workers=args.api_workers)
 
     tbase = get_baseline(target)
     if not tbase.get("status"):
@@ -1114,10 +1123,11 @@ def run(args) -> int:
         log("API response cache disabled (--no-cache)", "info")
 
     db = build_provider_db(offline=args.offline)
-    collector = gather(hosts, keys, args.workers, enabled, scopes=scopes)
+    collector = gather(hosts, keys, args.workers, enabled, scopes=scopes,
+                       api_workers=args.api_workers)
 
     origins, shields = classify_findings(
-        collector, db, use_asn=not args.no_asn, workers=args.workers)
+        collector, db, use_asn=not args.no_asn, workers=args.api_workers)
 
     origins.sort(key=lambda t: (t[0] != "Unknown", t[0]))
     shields.sort(key=lambda t: t[0])
@@ -1458,16 +1468,17 @@ def self_test() -> int:
                   "in.kalsel.web.bps.go.id": "203.123.60.41",
                   "leak.bps.go.id": "198.41.0.4"}.get(host, "9.9.9.9")
             collector_.add(ip, host, "dns")
+            collector_.dns_hosts.add((ip, host))
 
         globals()["src_crtsh"] = fake_crtsh
         globals()["src_resolve"] = fake_resolve
         try:
             col = gather(["kalsel.web.bps.go.id", "avior.bps.go.id"], {}, 1,
-                         {"dns", "crtsh"}, scopes=sc)
+                         {"dns", "crtsh"}, scopes=sc, api_workers=2)
             scoped_calls = {k: list(v) for k, v in calls.items()}
             calls["crtsh"].clear(); calls["resolve"].clear()
             legacy = gather(["kalsel.web.bps.go.id"], {}, 1,
-                            {"dns", "crtsh"}, scopes=[])
+                            {"dns", "crtsh"}, scopes=[], api_workers=2)
         finally:
             for n, fn in real_fn.items():
                 globals()[n] = fn
@@ -1480,6 +1491,79 @@ def self_test() -> int:
         assert "198.41.0.4" in legacy.findings
 
     _section("--scope pins per-apex queries + drops out-of-scope hosts", _check_scope)
+
+    # --api-workers governs the no-target source phase; -w governs verify
+    def _check_pools():
+        import threading as _th
+        state = {"cur": 0, "max": 0}
+        lock = _th.Lock()
+        real_resolve = globals()["src_resolve"]
+
+        def slow_resolve(host, collector_):
+            with lock:
+                state["cur"] += 1
+                state["max"] = max(state["max"], state["cur"])
+            time.sleep(0.03)
+            with lock:
+                state["cur"] -= 1
+
+        hosts = [f"h{i}.kalsel.web.bps.go.id" for i in range(24)]
+        globals()["src_resolve"] = slow_resolve
+        try:
+            gather(hosts, {}, 1, {"dns"}, scopes=["kalsel.web.bps.go.id"], api_workers=8)
+            api_max = state["max"]
+            state["cur"] = state["max"] = 0
+            gather(hosts, {}, 8, {"dns"}, scopes=["kalsel.web.bps.go.id"], api_workers=1)
+            api_max_one = state["max"]
+        finally:
+            globals()["src_resolve"] = real_resolve
+        assert api_max >= 3, api_max           # -w 1 does NOT serialize sources
+        assert api_max_one == 1, api_max_one   # api_workers decides
+
+        d = tempfile.mkdtemp(prefix="ipreal-pool-test-")
+        inp = os.path.join(d, "subs.txt")
+        Path(inp).write_text("".join(f"h{i}.kalsel.web.bps.go.id\n" for i in range(8)),
+                             encoding="utf-8")
+        col = Collector()
+        for i in range(8):
+            col.add(f"45.33.32.{i + 1}", f"h{i}.kalsel.web.bps.go.id", "dns")
+        vstate = {"cur": 0, "max": 0}
+
+        class _R:
+            status_code = 200
+            content = b"<html><title>Acme</title></html>"
+            text = "<html><title>Acme</title></html>"
+            headers = {}
+            is_redirect = False
+            is_permanent_redirect = False
+
+        def fake_get(url, **kw):
+            with lock:
+                vstate["cur"] += 1
+                vstate["max"] = max(vstate["max"], vstate["cur"])
+            time.sleep(0.05)
+            with lock:
+                vstate["cur"] -= 1
+            return _R()
+
+        args = build_parser().parse_args([
+            "-i", inp, "-o", os.path.join(d, "out"), "-c", os.path.join(d, "no.yaml"),
+            "-w", "2", "--api-workers", "8", "--verify", "--offline", "--no-asn",
+            "--sources", "dns", "--no-cache"])
+        saved = {n: globals()[n] for n in ("gather", "print_report", "_cert_matches")}
+        globals()["gather"] = lambda *a, **k: col
+        globals()["print_report"] = lambda *a, **k: None
+        globals()["_cert_matches"] = lambda *a, **k: False
+        requests.get = fake_get
+        try:
+            run(args)
+        finally:
+            for n, fn in saved.items():
+                globals()[n] = fn
+            requests.get = _real_get
+        assert vstate["max"] == 2, vstate["max"]   # verify follows -w, not api-workers
+
+    _section("--api-workers (sources) vs -w (verify) concurrency", _check_pools)
 
     print(C.wrap(C.G if ok else C.R, f"\nself-test {'PASSED' if ok else 'FAILED'}"))
     return 0 if ok else 1
@@ -1519,7 +1603,8 @@ REMINDER: only test targets you are explicitly authorized to test.""",
                         "origins to find a direct-IP (WAF-bypass) path.")
     p.add_argument("-o", "--outdir", help="output directory (default: out/<target>, or out/<root-domain> when no -t). auto-created")
     p.add_argument("-c", "--config", help="subfinder provider-config.yaml (default: ~/.config/subfinder/provider-config.yaml)")
-    p.add_argument("-w", "--workers", type=int, default=25, help="concurrent workers (default: 25)")
+    p.add_argument("-w", "--workers", type=int, default=25, help="concurrency for requests that touch the target / candidate IPs (verify + baseline). default: 25")
+    p.add_argument("--api-workers", type=int, default=8, help="concurrency for history/DNS sources + Team Cymru classify (no target contact). default: 8")
     p.add_argument("--scope", action="append", metavar="SUFFIX",
                    help="keep discovery inside a host subtree (repeatable and/or comma separated), "
                         "e.g. --scope kalsel.web.bps.go.id. Per-apex sources query SUFFIX instead of "
